@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Finals-Inspired — 3D FPS Demo</title>
+<style>
+  html,body{height:100%;margin:0;background:#111;color:#eee;font-family:system-ui,Segoe UI,Roboto,Arial}
+  #hud{position:fixed;left:12px;top:12px;z-index:10;display:flex;gap:10px;align-items:center}
+  .panel{background:rgba(0,0,0,.45);padding:8px 12px;border-radius:8px}
+  #crosshair{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);pointer-events:none;color:#fff;font-size:18px;z-index:10}
+  #overlay{position:fixed;left:0;top:0;right:0;bottom:0;display:flex;align-items:flex-end;justify-content:center;padding:24px;pointer-events:none}
+  #message{pointer-events:auto;background:rgba(0,0,0,.55);padding:10px 14px;border-radius:8px;color:#fff}
+  button{padding:8px 12px;border-radius:8px;border:0;background:#2b6;color:#042;cursor:pointer}
+  #canvasWrap{width:100vw;height:100vh;overflow:hidden}
+  a{color:#9cf}
+</style>
+</head>
+<body>
+<div id="hud">
+  <div class="panel">Score: <span id="score">0</span></div>
+  <div class="panel">Wave: <span id="wave">0</span></div>
+  <div class="panel">HP: <span id="hp">100</span></div>
+  <div class="panel">Enemies: <span id="enCount">0</span></div>
+  <div class="panel"><button id="restartBtn">Restart</button></div>
+</div>
+<div id="crosshair">+</div>
+<div id="canvasWrap"></div>
+<div id="overlay"><div id="message">Click to lock pointer and start — WASD to move • Mouse to look • Left click to shoot • R to respawn</div></div>
+
+<!-- Three.js from CDN -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.152.2/examples/js/controls/PointerLockControls.js"></script>
+
+<script>
+/*
+  Single-file 3D first-person game inspired by Roblox Finals.
+  - Uses Three.js (CDN) for 3D rendering
+  - Procedural textures via canvas -> THREE.CanvasTexture
+  - Simple AI enemies that path towards player on XZ plane
+  - Shooting with raycast (hits enemies)
+  - Waves, score, HUD
+  NOTE: open in a browser with internet to load Three.js CDN.
+*/
+
+// HUD elems
+const scoreEl = document.getElementById('score');
+const waveEl = document.getElementById('wave');
+const hpEl = document.getElementById('hp');
+const enCountEl = document.getElementById('enCount');
+const restartBtn = document.getElementById('restartBtn');
+const message = document.getElementById('message');
+
+let score = 0, wave = 0;
+
+// Three.js setup
+const container = document.getElementById('canvasWrap');
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(window.devicePixelRatio);
+container.appendChild(renderer.domElement);
+
+// PointerLock controls for FPS
+const controls = new THREE.PointerLockControls(camera, renderer.domElement);
+
+message.addEventListener('click', ()=>{ controls.lock(); });
+controls.addEventListener('lock', ()=>{ message.style.display='none'; });
+controls.addEventListener('unlock', ()=>{ message.style.display='block'; message.textContent='Pointer unlocked. Click to lock and continue.'; });
+
+// Basic lighting
+const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.7); scene.add(hemi);
+const dir = new THREE.DirectionalLight(0xffffff, 0.6); dir.position.set(5,10,2); scene.add(dir);
+
+// Procedural canvas textures
+function makeStripTexture(a,b,stripe){
+  const c=document.createElement('canvas'); c.width=256; c.height=256; const g=c.getContext('2d');
+  g.fillStyle=a; g.fillRect(0,0,256,256);
+  g.fillStyle=b;
+  for(let x=0;x<256;x+=stripe) g.fillRect(x,0,stripe/2,256);
+  return new THREE.CanvasTexture(c);
+}
+const texGround = makeStripTexture('#4a8','#6da',18);
+const texPlayer = makeStripTexture('#ffd27f','#ff9c34',10);
+const texEnemy = makeStripTexture('#9cf','#59a',12);
+
+// Floor
+const floorGeo = new THREE.PlaneGeometry(200,200,10,10);
+const floorMat = new THREE.MeshStandardMaterial({map:texGround, side:THREE.DoubleSide});
+const floor = new THREE.Mesh(floorGeo, floorMat); floor.rotation.x = -Math.PI/2; scene.add(floor);
+
+// Walls (simple boundaries)
+const wallMat = new THREE.MeshStandardMaterial({color:'#222'});
+const wallGeo = new THREE.BoxGeometry(200,6,2);
+const walls = [];
+const w1 = new THREE.Mesh(wallGeo, wallMat); w1.position.set(0,3,-101); scene.add(w1); walls.push(w1);
+const w2 = w1.clone(); w2.position.set(0,3,101); scene.add(w2); walls.push(w2);
+const w3 = new THREE.Mesh(new THREE.BoxGeometry(2,6,200), wallMat); w3.position.set(-101,3,0); scene.add(w3); walls.push(w3);
+const w4 = w3.clone(); w4.position.set(101,3,0); scene.add(w4); walls.push(w4);
+
+// Player: invisible capsule; camera represents eyes. We'll show a simple weapon model
+const player = { x:0, y:1.6, z:0, hp:100, speed:6, velocity:new THREE.Vector3() };
+camera.position.set(player.x, player.y, player.z);
+controls.getObject().position.copy(camera.position);
+
+// Weapon model (simple box) parented to camera
+const weaponGeo = new THREE.BoxGeometry(0.2,0.15,0.6);
+const weaponMat = new THREE.MeshStandardMaterial({color:'#333'});
+const weapon = new THREE.Mesh(weaponGeo, weaponMat);
+weapon.position.set(0,-0.15,-0.5);
+camera.add(weapon);
+scene.add(camera);
+
+// Enemy container
+const enemies = [];
+
+// Create enemy mesh factory
+function makeEnemy(){
+  const g = new THREE.SphereGeometry(0.6,16,12);
+  const m = new THREE.MeshStandardMaterial({map:texEnemy});
+  const mesh = new THREE.Mesh(g,m);
+  mesh.position.set(rnd(-60,60),0.6,rnd(-60,60));
+  scene.add(mesh);
+  return {mesh:mesh,hp:30 + wave*8,speed:1.5 + wave*0.2};
+}
+
+function rnd(a,b){return Math.random()*(b-a)+a}
+
+// Simple ray-based shooting
+let canShoot = true;
+const shootCooldown = 0.12; // seconds
+let lastShot = 0;
+
+window.addEventListener('mousedown', (e)=>{ if(e.button===0) tryShoot(); });
+function tryShoot(){ if(!controls.isLocked) return; const now = performance.now()/1000; if(now - lastShot < shootCooldown) return; lastShot = now; shoot(); }
+
+const raycaster = new THREE.Raycaster();
+function shoot(){
+  // muzzle flash particle
+  const origin = camera.getWorldPosition(new THREE.Vector3());
+  const dir = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+  raycaster.set(origin, dir);
+  const hits = raycaster.intersectObjects(enemies.map(e=>e.mesh));
+  if(hits.length>0){
+    const hit = hits[0];
+    // find enemy object and damage
+    const en = enemies.find(x=>x.mesh===hit.object);
+    if(en){ en.hp -= 20; spawnHit(hit.point); if(en.hp<=0) killEnemy(en); }
+  }
+  // slight kick animation
+  weapon.position.z = -0.3; setTimeout(()=>{ weapon.position.z = -0.5; },80);
+}
+
+// Hit particle
+const hitParticles = [];
+function spawnHit(pos){ const p={pos:pos.clone(), life:0.6}; hitParticles.push(p); }
+
+// Kill enemy
+function killEnemy(en){ score += 150 + wave*10; scene.remove(en.mesh); const idx = enemies.indexOf(en); if(idx>=0) enemies.splice(idx,1); updateUI(); }
+
+// UI update
+function updateUI(){ scoreEl.textContent = score; waveEl.textContent = wave; hpEl.textContent = Math.max(0, Math.floor(player.hp)); enCountEl.textContent = enemies.length; }
+
+// Movement keys
+const keys = {w:false,a:false,s:false,d:false,shift:false};
+window.addEventListener('keydown', e=>{ const k=e.key.toLowerCase(); if(k in keys) keys[k]=true; if(k==='r'){ resetGame(); } });
+window.addEventListener('keyup', e=>{ const k=e.key.toLowerCase(); if(k in keys) keys[k]=false; });
+
+// Spawn waves
+let spawnTimer = 0;
+function nextWave(){ wave++; const num = 3 + Math.floor(wave*2.2); for(let i=0;i<num;i++){ const en = makeEnemy(); // move spawn to rim
+    const angle = Math.random()*Math.PI*2; en.mesh.position.set(Math.cos(angle)*80,0.6,Math.sin(angle)*80); enemies.push(en); }
+  updateUI(); }
+
+// Simple enemy AI: move towards player on XZ, avoid overlapping
+function updateEnemies(dt){
+  for(const en of enemies){
+    const pos = en.mesh.position;
+    const dx = player.x - pos.x; const dz = player.z - pos.z; const d = Math.hypot(dx,dz) || 0.001;
+    // steering toward player
+    const nx = dx/d, nz = dz/d;
+    // separation
+    let sepX=0, sepZ=0, count=0;
+    for(const other of enemies){ if(other===en) continue; const od = other.mesh.position; const dist = Math.hypot(pos.x-od.x, pos.z-od.z); if(dist<1.6){ sepX += pos.x-od.x; sepZ += pos.z-od.z; count++; } }
+    if(count>0){ sepX/=count; sepZ/=count; }
+    pos.x += (nx*en.speed + sepX*0.6)*dt;
+    pos.z += (nz*en.speed + sepZ*0.6)*dt;
+    // attack if close
+    const distToPlayer = Math.hypot(pos.x-player.x,pos.z-player.z);
+    if(distToPlayer < 1.2){ player.hp -= 12*dt; if(player.hp<=0){ player.hp=0; onGameOver(); } updateUI(); }
+  }
+}
+
+function onGameOver(){ controls.unlock(); message.style.display='block'; message.textContent = 'You were eliminated! Score: ' + score + ' • Press Restart or R to try again.'; }
+
+// Spawn occasional reinforcements
+function maybeSpawn(dt){ spawnTimer += dt; if(spawnTimer > 0.6){ spawnTimer = 0; if(enemies.length<Math.min(16,5+wave*3) && Math.random()<0.6) { const en = makeEnemy(); const angle = Math.random()*Math.PI*2; en.mesh.position.set(Math.cos(angle)*80,0.6,Math.sin(angle)*80); enemies.push(en); updateUI(); } } }
+
+// Simple random movement and camera sync
+let prevTime = performance.now()/1000;
+function animate(){
+  const now = performance.now()/1000; const dt = Math.min(0.05, now - prevTime); prevTime = now;
+
+  // movement
+  if(controls.isLocked){
+    const speed = keys.shift ? player.speed * 1.6 : player.speed;
+    const dir = new THREE.Vector3();
+    if(keys.w) dir.z -= 1; if(keys.s) dir.z += 1; if(keys.a) dir.x -= 1; if(keys.d) dir.x += 1;
+    if(dir.length()>0){ dir.normalize(); // transform by camera yaw
+      const euler = new THREE.Euler(0, camera.rotation.y, 0, 'YXZ');
+      dir.applyEuler(euler);
+      player.x += dir.x * speed * dt; player.z += dir.z * speed * dt;
+    }
+    // clamp within arena
+    player.x = THREE.MathUtils.clamp(player.x, -98, 98); player.z = THREE.MathUtils.clamp(player.z, -98, 98);
+    controls.getObject().position.set(player.x, player.y, player.z);
+  }
+
+  // update enemies
+  updateEnemies(dt);
+  maybeSpawn(dt);
+
+  // hit particles life
+  for(let i=hitParticles.length-1;i>=0;i--){ const p=hitParticles[i]; p.life -= dt; if(p.life<=0) hitParticles.splice(i,1); }
+
+  // wave progression: when none left, small delay then next wave
+  if(enemies.length===0){ spawnTimer+=dt; if(spawnTimer>1.3){ spawnTimer=0; nextWave(); } }
+
+  // update UI
+  updateUI();
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(animate);
+}
+
+// helper to spawn visual hit markers
+const tempSphereGeo = new THREE.SphereGeometry(0.08,8,6);
+function drawHitMarkers(){ // render transient meshes for hits
+  // remove old markers
+  scene.traverse(obj=>{ if(obj.userData && obj.userData._isHitMarker) scene.remove(obj); });
+  for(const p of hitParticles){ const m = new THREE.Mesh(tempSphereGeo, new THREE.MeshBasicMaterial({color:0xffcc66})); m.position.copy(p.pos); m.userData._isHitMarker = true; scene.add(m); }
+}
+
+// utility: spawn initial wave
+function startGame(){ enemies.length=0; for(const e of enemies) scene.remove(e.mesh); enemies.length=0; score=0; player.hp=100; wave=0; nextWave(); updateUI(); }
+
+restartBtn.addEventListener('click', ()=>{ resetGame(); });
+function resetGame(){ // clear enemies
+  for(const e of enemies) scene.remove(e.mesh); enemies.length=0; hitParticles.length=0; score=0; player.hp=100; wave=0; spawnTimer=0; startGame(); message.style.display='none'; controls.lock(); }
+
+// kill enemy helper already defined
+
+// window resize
+window.addEventListener('resize', ()=>{ camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+
+// animate + draw hit markers
+function loop(){ drawHitMarkers(); requestAnimationFrame(loop); }
+
+// start
+startGame(); prevTime = performance.now()/1000; animate(); loop();
+
+</script>
+</body>
+</html>
